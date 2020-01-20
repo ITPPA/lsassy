@@ -26,3 +26,7 @@ MANIFEST
 
 # IDE
 .idea
+
+# Tests
+
+test/tests.config.sh

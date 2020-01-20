@@ -1,26 +1,40 @@
 # Author:
 #  Romain Bentz (pixis - @hackanddo)
 # Website:
-#  https://beta.hackndo.com
+#  https://beta.hackndo.com [FR]
+#  https://en.hackndo.com [EN]
 
-import time, re, sys
-from impacket.smbconnection import SMBConnection, SessionError
-from impacket.smb3structs import FILE_READ_DATA, SMB2_DIALECT_21, SMB2_DIALECT_30
+import re
+import sys
+import time
 from socket import getaddrinfo, gaierror
+
+from impacket.smb3structs import FILE_READ_DATA
+from impacket.smbconnection import SMBConnection, SessionError
+
 from lsassy.log import Logger
+from lsassy.defines import *
+
 
 class ImpacketConnection:
-    def __init__(self, conn=None, debug=False):
-        self._log = Logger(debug)
+    def __init__(self, conn=None, log=None):
+        self._log = log if log is not None else Logger()
+        self.hostname = ""
+        self.username = ""
+        self.domain_name = ""
+        self.password = ""
+        self.lmhash = ""
+        self.nthash = ""
         self.conn = conn
 
     @staticmethod
-    def from_args(arg, debug=False):
-        pattern = re.compile(r"^(?:(?P<domain_name>[a-zA-Z0-9._-]+)/)?(?P<username>[^:/]+)(?::(?P<password>.*))?@(?P<hostname>[a-zA-Z0-9.-]+):/(?P<share_name>[^/]+)(?P<filePath>/(?:[^/]*/)*[^/]+)$")
+    def from_args(arg, log):
+        pattern = re.compile(r"^(?:(?P<domain_name>[a-zA-Z0-9._-]+)/)?(?P<username>[^:/]+)(?::(?P<password>.*))?@(?P<hostname>[a-zA-Z0-9.-]+)$")
         matches = pattern.search(arg.target)
         if matches is None:
-            raise Exception("{} is not valid. Expected format : [domain/]username[:password]@host:/share_name/path/to/file".format(arg.target))
-        domain_name, username, password, hostname, share_name, filePath = matches.groups()
+            log.warn("{} is not valid. Expected format : [domain/]username[:password]@host".format(arg.target))
+            return RetCode(ERROR_INVALID_FORMAT)
+        domain_name, username, password, hostname = matches.groups()
         if matches.group("domain_name") is None:
             domain_name = "."
         if matches.group("password") is None and arg.hashes is None:
@@ -36,44 +50,63 @@ class ImpacketConnection:
         else:
             lmhash = ''
             nthash = ''
-        return ImpacketConnection(debug=debug).login(hostname, domain_name, username, password, lmhash, nthash), share_name, filePath
-
+        return ImpacketConnection(log=log).login(hostname, domain_name, username, password, lmhash, nthash)
 
     def login(self, ip, domain_name, username, password, lmhash, nthash):
         try:
             ip = list({addr[-1][0] for addr in getaddrinfo(ip, 0, 0, 0, 0)})[0]
-        except gaierror:
-            raise Exception("No DNS found to resolve %s.\n"
-                            "Please make sure that your DNS settings can resolve %s" % (ip, ip))
-        conn = SMBConnection(ip, ip)
+        except gaierror as e:
+            return RetCode(ERROR_DNS_ERROR, e)
+
+        self.hostname = ip
+        self.domain_name = domain_name
+        self.username = username
+        self.password = password
+        self.lmhash = lmhash
+        self.nthash = nthash
+
+        try:
+            conn = SMBConnection(ip, ip)
+        except Exception as e:
+            return RetCode(ERROR_CONNEXION_ERROR, e)
+
         username = username.split("@")[0]
         self._log.debug("Authenticating against {}".format(ip))
         try:
             conn.login(username, password, domain=domain_name, lmhash=lmhash, nthash=nthash, ntlmFallback=True)
-            self._log.debug("Authenticated")
+            self._log.success("Authenticated")
         except SessionError as e:
-            e_type, e_msg = e.getErrorString()
-            self._log.error("{}: {}".format(e_type, e_msg))
             self._log.debug("Provided credentials : {}\\{}:{}".format(domain_name, username, password))
-            sys.exit(1)
+            return RetCode(ERROR_LOGIN_FAILURE, e)
         except Exception as e:
-            raise Exception("Unknown error : {}".format(e))
+            return RetCode(ERROR_UNDEFINED, e)
         self.conn = conn
         return self
 
     def connectTree(self, share_name):
-        return self.conn._SMBConnection.connectTree(share_name)
+        return self.conn.connectTree(share_name)
 
-    def openFile(self, tid, fpath):
+    def openFile(self, tid, fpath, timeout=10):
+        self._log.debug("Opening file {}".format(fpath))
+
+        start = time.time()
+        try:
+            timeout = float(timeout)
+        except ValueError as e:
+            self._log.debug("Timeout value \"{}\" is not valid. Timeout set to 10".format(str(timeout)))
+            timeout = 10
+
         while True:
             try:
                 fid = self.conn.openFile(tid, fpath, desiredAccess=FILE_READ_DATA)
                 self._log.debug("File {} opened".format(fpath))
                 return fid
             except Exception as e:
-                if str(e).find('STATUS_SHARING_VIOLATION') >= 0:
+                if str(e).find('STATUS_SHARING_VIOLATION') >= 0 or str(e).find('STATUS_OBJECT_NAME_NOT_FOUND') >= 0:
                     # Output not finished, let's wait
-                    time.sleep(2)
+                    if time.time() - start > timeout:
+                        raise(Exception(e))
+                    time.sleep(1)
                 else:
                     raise Exception(e)
 
@@ -88,7 +121,6 @@ class ImpacketConnection:
                     time.sleep(2)
                 else:
                     raise Exception(e)
-        
 
     def getFile(self, share_name, path_name, callback):
         while True:
@@ -123,6 +155,16 @@ class ImpacketConnection:
 
     def readFile(self, tid, fid, offset, size):
         return self.conn.readFile(tid, fid, offset, size, singleCall=False)
+
+    def closeFile(self, tid, fid):
+        return self.conn.closeFile(tid, fid)
+
+    def isadmin(self):
+        try:
+            self.connectTree("C$")
+            return RetCode(ERROR_SUCCESS)
+        except Exception as e:
+            return RetCode(ERROR_ACCESS_DENIED, e)
 
     def close(self):
         self.conn.close()

